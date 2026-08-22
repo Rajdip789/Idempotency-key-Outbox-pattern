@@ -1,0 +1,37 @@
+spring:
+  application:
+    name: idempotency-poc
+
+  datasource:
+    # File-based H2 (not in-memory) on purpose: if you kill the app mid-request
+    # to simulate a crash, the idempotency_keys table survives the restart,
+    # so you can actually observe the PENDING-row-stuck-forever problem.
+    url: jdbc:h2:file:./data/idempotency-poc;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+server:
+  port: 8080
+
+# Toggle this to true to simulate the "app crashes after charging the
+# provider but before marking the key COMPLETED" failure case.
+poc:
+  simulate-crash-after-charge: false
+  pending-lease-seconds: 30
+  # Outbox pattern knobs:
+  simulate-publish-failure: false
+  outbox-poll-interval-ms: 3000

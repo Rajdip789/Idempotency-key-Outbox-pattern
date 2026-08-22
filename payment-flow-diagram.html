@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Idempotency + Outbox Flow</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117;
+    --panel:#151b23;
+    --line:#2a323d;
+    --text:#c9d1d9;
+    --muted:#7d8590;
+    --amber:#e3b341;
+    --green:#3fb950;
+    --red:#f85149;
+    --blue:#58a6ff;
+    --mono:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--mono);
+    padding:24px 16px 60px;
+  }
+  h1{
+    font-size:15px;
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    color:var(--muted);
+    margin:0 0 4px;
+    font-weight:600;
+  }
+  h1 span{color:var(--text);}
+  .sub{
+    color:var(--muted);
+    font-size:12.5px;
+    margin:0 0 28px;
+    line-height:1.5;
+  }
+  .legend{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px 18px;
+    margin:0 0 28px;
+    font-size:11.5px;
+    color:var(--muted);
+  }
+  .legend b{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px;}
+  .legend .a b{background:var(--blue);}
+  .legend .b b{background:var(--amber);}
+  .legend .c b{background:var(--green);}
+  .legend .d b{background:var(--red);}
+
+  .section-label{
+    font-size:12px;
+    color:var(--muted);
+    text-transform:uppercase;
+    letter-spacing:.08em;
+    margin:36px 0 10px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+  .section-label::after{
+    content:'';
+    flex:1;
+    height:1px;
+    background:var(--line);
+  }
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:14px 10px;
+    overflow-x:auto;
+  }
+  .caption{
+    font-size:11.5px;
+    color:var(--muted);
+    margin-top:10px;
+    line-height:1.6;
+    padding:0 2px;
+  }
+  .caption code{
+    color:var(--amber);
+    background:rgba(227,179,65,0.08);
+    padding:1px 5px;
+    border-radius:3px;
+  }
+  .mermaid{font-family:var(--mono) !important;}
+</style>
+</head>
+<body>
+
+<h1><span>Payment flow</span> — idempotency key + transactional outbox</h1>
+<p class="sub">Two independent state machines, one HTTP request. The idempotency table guards against the request arriving twice; the outbox table guards against the "PaymentSucceeded" event never reaching anyone.</p>
+
+<div class="legend">
+  <span class="a"><b></b>fresh path</span>
+  <span class="b"><b></b>PENDING / waiting</span>
+  <span class="c"><b></b>terminal success</span>
+  <span class="d"><b></b>conflict / reject</span>
+</div>
+
+<div class="section-label">1 · Idempotency key — inbound request</div>
+<div class="panel"><div class="mermaid" id="d1"></div></div>
+<p class="caption">
+The <code>idem_key</code> PRIMARY KEY does the locking — no explicit <code>SELECT ... FOR UPDATE</code>. Two requests racing to insert the same key: exactly one succeeds, the other reads back whatever state the winner (or a previous, now-dead attempt) left behind.
+</p>
+
+<div class="section-label">2 · Transactional outbox — outbound event</div>
+<div class="panel"><div class="mermaid" id="d2"></div></div>
+<p class="caption">
+The outbox <code>INSERT</code> happens inside the <b>same</b> transaction as the idempotency-key <code>UPDATE</code> — so "payment completed" and "event queued to publish" are atomic with each other by construction, not by coordination. The poller is a completely separate process on its own clock; a broker outage just leaves rows <code>PENDING</code> for a bit longer.
+</p>
+
+<div class="section-label">3 · Full picture — one request, both tables</div>
+<div class="panel"><div class="mermaid" id="d3"></div></div>
+<p class="caption">
+Read top to bottom: the HTTP thread only ever touches <code>idempotency_keys</code> (twice, in two separate commits) and, in passing, drops one row into <code>outbox_events</code>. Nothing about publishing the event is on the request's critical path — that's the whole point.
+</p>
+
+<script>
+mermaid.initialize({
+  startOnLoad:false,
+  theme:'dark',
+  themeVariables:{
+    background:'#151b23',
+    primaryColor:'#1c2530',
+    primaryTextColor:'#c9d1d9',
+    primaryBorderColor:'#2a323d',
+    lineColor:'#5b6472',
+    secondaryColor:'#1c2530',
+    tertiaryColor:'#1c2530',
+    fontFamily:'SFMono-Regular,Consolas,monospace',
+    fontSize:'13px',
+    edgeLabelBackground:'#151b23'
+  },
+  flowchart:{ curve:'basis', htmlLabels:true, nodeSpacing:32, rankSpacing:38 },
+  sequence:{ actorFontFamily:'monospace', messageFontFamily:'monospace', noteFontFamily:'monospace' }
+});
+
+const d1 = `
+flowchart TD
+    A["POST /payments\\nIdempotency-Key: abc123"] --> B{"INSERT idem_key\\n(status=PENDING)"}
+    B -->|"insert succeeds\\n(we own the key)"| C["Charge payment provider"]
+    B -->|"duplicate key\\n(DataIntegrityViolation)"| D{"read existing row\\nstatus?"}
+
+    D -->|COMPLETED| E["Replay stored response\\n200 OK, no charge"]
+    D -->|"PENDING\\n+ lease not expired"| F["409 Conflict\\n'try again shortly'"]
+    D -->|"PENDING\\n+ lease EXPIRED"| G["Reclaim row -> PENDING\\n(previous owner crashed)"]
+    D -->|FAILED| G
+
+    G --> C
+    C --> H{"charge\\nsucceeded?"}
+    H -->|yes| I["UPDATE status=COMPLETED\\n+ store response body"]
+    H -->|no| J["UPDATE status=FAILED"]
+    I --> K["201 Created"]
+    J --> L["error to client\\n(safe to retry)"]
+
+    classDef fresh fill:#132a45,stroke:#58a6ff,color:#c9d1d9
+    classDef pending fill:#3a2f10,stroke:#e3b341,color:#c9d1d9
+    classDef ok fill:#0f2a17,stroke:#3fb950,color:#c9d1d9
+    classDef bad fill:#3a1414,stroke:#f85149,color:#c9d1d9
+
+    class A,B,C,H fresh
+    class D,F,G pending
+    class E,I,K ok
+    class J,L bad
+`;
+
+const d2 = `
+sequenceDiagram
+    participant Req as HTTP request thread
+    participant DB as Database (one txn)
+    participant Out as outbox_events
+    participant Poll as OutboxPoller (every 3s)
+    participant Broker as SNS / SQS (fake)
+
+    Req->>DB: UPDATE idempotency_keys\\nSET status=COMPLETED
+    Req->>Out: INSERT (status=PENDING,\\neventType=PaymentSucceeded)
+    Note over DB,Out: same REQUIRES_NEW transaction --\\nboth commit together or not at all
+    DB-->>Req: commit
+    Req-->>Req: return 201 to client\\n(publishing NOT on this path)
+
+    loop every poll interval
+        Poll->>Out: SELECT * WHERE status=PENDING
+        Out-->>Poll: pending rows
+        Poll->>Broker: publish(eventType, payload)
+        alt publish succeeds
+            Broker-->>Poll: ack
+            Poll->>Out: UPDATE status=PUBLISHED
+        else broker unavailable
+            Broker--xPoll: error
+            Poll->>Out: attempts++, lastError set\\n(stays PENDING)
+        end
+    end
+`;
+
+const d3 = `
+flowchart TD
+    subgraph REQ["single HTTP request"]
+        direction TB
+        A["POST /payments"] --> B["txn 1: INSERT\\nidempotency_keys (PENDING)"]
+        B --> C["charge provider"]
+        C --> D["txn 2: UPDATE idempotency_keys -> COMPLETED\\n+ INSERT outbox_events -> PENDING\\n(one transaction)"]
+        D --> E["return 201 to client"]
+    end
+
+    subgraph BG["background, decoupled"]
+        direction TB
+        F["OutboxPoller tick"] --> G["SELECT outbox_events\\nWHERE status = PENDING"]
+        G --> H["publish to broker"]
+        H --> I["UPDATE status = PUBLISHED\\n(or leave PENDING + retry)"]
+    end
+
+    D -.->|"row now exists,\\nwaiting to be picked up"| G
+
+    classDef req fill:#132a45,stroke:#58a6ff,color:#c9d1d9
+    classDef bg fill:#3a2f10,stroke:#e3b341,color:#c9d1d9
+    class A,B,C,D,E req
+    class F,G,H,I bg
+`;
+
+mermaid.render('svg1', d1).then(r => document.getElementById('d1').innerHTML = r.svg);
+mermaid.render('svg2', d2).then(r => document.getElementById('d2').innerHTML = r.svg);
+mermaid.render('svg3', d3).then(r => document.getElementById('d3').innerHTML = r.svg);
+</script>
+</body>
+</html>
